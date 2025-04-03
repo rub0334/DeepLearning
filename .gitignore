@@ -2,9 +2,22 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.DS_Store
 
-#Dossier à ignorer pour le projet
-TextOCR/
+#Dossier et fichiers à ignorer pour le projet
+Test_Images/
+test-images-with-rotation.csv
+test-images-with-rotation-filtered.csv
+TextOCR_AnnotationsTest.json
+
+Train_Images/
+TextOCR_AnnotationsTraining.json
+train-images-boxable-with-rotation.csv
+train-images-boxable-with-rotation-filtered.csv
+
+Validation_Images/
+TextOCR_AnnotationsValidations.json
+
 TMNIST/
 # C extensions
 *.so
