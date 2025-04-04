@@ -1,0 +1,7 @@
+torch>=1.12.0     # Version avec support stable pour transforms v2 et AMP
+torchvision>=0.13.0 # Version correspondante à torch
+numpy>=1.20.0
+Pillow>=9.0.0     # Pour le chargement d'images
+matplotlib>=3.5.0 # Pour la visualisation
+tqdm>=4.60.0      # Pour les barres de progression
+# pycocotools    # Optionnel, si vous implémentez l'évaluation mAP COCO

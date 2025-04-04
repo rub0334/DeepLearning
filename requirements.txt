@@ -1,0 +1,25 @@
+# requirements.txt
+
+# Core ML Framework
+# Install PyTorch matching your CUDA version from: https://pytorch.org/get-started/locally/
+# Example command (check the website for current versions):
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+torch>=1.10 # Use a reasonably recent version
+
+# Data Handling and Processing
+numpy>=1.19
+Pillow>=8.0   # For image loading
+opencv-python>=4.5 # For image processing, drawing, contour finding
+albumentations>=1.0 # For data augmentation
+
+# Metrics and Utilities
+tqdm>=4.60       # Progress bars
+tensorboard>=2.8 # For logging (often comes with PyTorch)
+shapely>=1.7     # For polygon IoU calculation (detection metrics)
+jiwer>=2.3       # For Word Error Rate (WER) and Character Error Rate (CER) calculation
+
+# Notes:
+# 1. Make sure you have a compatible C++ compiler if building some packages from source.
+# 2. The specific versions listed are examples; you might adjust them based on compatibility
+#    or use pip freeze > requirements.txt in your working virtual environment after installation.
+# 3. Ensure your Python version is compatible (e.g., Python 3.7+ is generally safe).
