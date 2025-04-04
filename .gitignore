@@ -188,3 +188,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+partie_1/checkpoints/best_model.pth.tar
+partie_1/checkpoints/checkpoint.pth.tar
+/partie_1/checkpoints
