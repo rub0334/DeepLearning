@@ -1,350 +1,276 @@
+# data_loader.py
 import torch
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms.v2 as T # Utilisation des nouvelles transforms v2
-from PIL import Image
-import os
+from torchvision import transforms
+from PIL import Image, ImageDraw # Pillow pour charger les images
 import json
+import os
 import numpy as np
-from utils import set_seed, save_checkpoint, load_checkpoint, visualize_detection
-# Dans data_loader.py, au début OU dans if __name__ == '__main__':
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 
+import config # Importer notre configuration
+import utils  # Importer nos utilitaires (pour get_bounding_box_from_points)
 
-from utils import polygon_to_bbox
-import config
-
-class TextOCRDatasetDetection(Dataset):
-    def __init__(self, json_path, img_dir, transforms=None, target_img_size=None):
+class TextOCRDetectionDataset(Dataset):
+    """
+    Dataset PyTorch pour la TÂCHE DE DÉTECTION sur TextOCR.
+    Charge les images et les annotations de boîtes englobantes.
+    """
+    def __init__(self, annotation_file, image_dir, transforms=None):
         """
-        Dataset pour la détection de texte sur TextOCR.
-
         Args:
-            json_path (str): Chemin vers le fichier JSON d'annotations (format COCO-Text).
-            img_dir (str): Chemin vers le répertoire contenant les images.
-            transforms (callable, optional): Transformations à appliquer à l'image et aux cibles.
-            target_img_size (tuple, optional): Taille (H, W) vers laquelle redimensionner les images et les boîtes.
+            annotation_file (str): Chemin vers le fichier JSON d'annotations (train ou val).
+            image_dir (str): Chemin vers le dossier contenant les images.
+            transforms (callable, optional): Transformations à appliquer sur les images.
         """
-        print(f"Loading annotations from: {json_path}")
-        if not os.path.exists(json_path):
-            raise FileNotFoundError(f"Annotation file not found: {json_path}")
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        print("Annotations loaded.")
+        print(f"Chargement des annotations depuis: {annotation_file}")
+        print(f"Chargement des images depuis: {image_dir}")
 
-        self.img_dir = img_dir
-        if not os.path.exists(self.img_dir):
-             raise FileNotFoundError(f"Image directory not found: {self.img_dir}")
-
+        self.image_dir = image_dir
         self.transforms = transforms
-        self.target_img_size = target_img_size # (height, width)
 
-        self.imgs = data['imgs']
-        self.anns = data['anns']
-        self.img_to_anns = data.get('imgToAnns', None) # Utiliser get pour la compatibilité
+        with open(annotation_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
 
-        if self.img_to_anns is None:
-             # Créer img_to_anns si manquant (peut arriver avec des formats dérivés)
-             print("imgToAnns not found in JSON, creating it...")
-             self.img_to_anns = {}
-             for ann_id, ann in self.anns.items():
-                 img_id = str(ann['image_id']) # Assurer que l'img_id est une chaîne si les clés sont des chaînes
-                 if img_id not in self.img_to_anns:
-                     self.img_to_anns[img_id] = []
-                 self.img_to_anns[img_id].append(ann_id)
-             print("imgToAnns created.")
+        self.annotations = data['anns']
+        self.img_to_anns = data['imgToAnns']
+        self.images_info = data['imgs']
 
-        self.img_ids = list(self.imgs.keys())
+        # Filtrer les images pour ne garder que celles présentes dans imgToAnns
+        # (Certaines images peuvent ne pas avoir d'annotations)
+        self.image_ids = [img_id for img_id in data['imgs'].keys() if img_id in self.img_to_anns and len(self.img_to_anns[img_id]) > 0]
 
-        print(f"Dataset initialized with {len(self.img_ids)} images.")
-        # Pré-vérification rapide de quelques images/annotations
-        if len(self.img_ids) > 0:
-             self._check_sample(0)
-
-
-    def _check_sample(self, idx):
-        """Vérifie si un échantillon peut être chargé."""
-        try:
-            img_id = self.img_ids[idx]
-            img_info = self.imgs[img_id]
-            img_path = os.path.join(self.img_dir, img_info['file_name'])
-            if not os.path.exists(img_path):
-                 print(f"Warning: Image file missing for img_id {img_id}: {img_path}")
-                 # Optionnellement, on pourrait supprimer cet img_id de la liste
-            # Tenter de charger les annotations
-            ann_ids = self.img_to_anns.get(img_id, [])
-            if not ann_ids:
-                # Images sans texte sont valides mais peuvent nécessiter une gestion spéciale
-                pass #print(f"Info: Image {img_id} has no text annotations.")
-        except Exception as e:
-             print(f"Error checking sample index {idx}, img_id {self.img_ids[idx]}: {e}")
+        print(f"Nombre total d'images dans le JSON: {len(data['imgs'])}")
+        print(f"Nombre d'images avec annotations utilisables: {len(self.image_ids)}")
 
 
     def __len__(self):
-        return len(self.img_ids)
+        """Retourne le nombre d'images dans le dataset."""
+        return len(self.image_ids)
+
+
 
     def __getitem__(self, idx):
-        img_id = self.img_ids[idx]
-        img_info = self.imgs[img_id]
-        img_path = os.path.join(self.img_dir, img_info['file_name'])
+        """
+        Retourne une image et ses annotations associées.
+
+        Args:
+            idx (int): Index de l'image à récupérer.
+
+        Returns:
+            tuple: (image, target) où
+                - image (torch.Tensor): Image transformée.
+                - target (dict): Dictionnaire contenant les clés:
+                    - 'boxes' (torch.Tensor): Boîtes englobantes [N, 4] au format [xmin, ymin, xmax, ymax].
+                    - 'labels' (torch.Tensor): Étiquettes de classe [N] (toujours 1 pour 'text').
+                    - 'image_id' (torch.Tensor): ID de l'image (index du dataset ici).
+                    - 'area' (torch.Tensor): Aire des boîtes englobantes [N].
+                    - 'iscrowd' (torch.Tensor): Indicateur de foule [N] (toujours 0 ici).
+        """
+        image_id = self.image_ids[idx]
+        img_info = self.images_info[image_id]
+        json_file_path_part = img_info['file_name']  # Ex: "train/abc.jpg" ou "val/xyz.jpg"
+
+        # --- CORRECTION/SIMPLIFICATION PATH CONSTRUCTION ---
+        # Extraire seulement le nom du fichier depuis le chemin dans le JSON
+        image_filename = os.path.basename(json_file_path_part)  # Obtient "abc.jpg" ou "xyz.jpg"
+
+        # Utiliser directement self.image_dir qui a été fourni lors de la création du Dataset
+        # Pour train_dataset, self.image_dir sera config.TRAIN_IMAGE_DIR
+        # Pour val_dataset, self.image_dir sera config.VAL_IMAGE_DIR
+        image_path = os.path.join(self.image_dir, image_filename)
+        # --- FIN CORRECTION/SIMPLIFICATION ---
 
         try:
-            # Utiliser 'L' pour charger en niveaux de gris puis convertir en RGB pour gérer les images N&B
-            image = Image.open(img_path).convert("RGB")
-            original_w, original_h = image.size
+            # Charger l'image en RGB
+            image = Image.open(image_path).convert("RGB")
+            img_width, img_height = image.size
         except FileNotFoundError:
-            print(f"Error: Image file not found at {img_path}. Returning None.")
-            # Retourner des placeholders ou lever une exception gérable dans collate_fn
-            # Pour l'instant, on retourne None, ce qui sera filtré dans collate_fn
-            return None
+            # L'erreur sera maintenant plus directe si le self.image_dir était incorrectement défini
+            # ou si le fichier manque réellement dans le bon dossier.
+            print(
+                f"ERREUR (Dataset): Image non trouvée à {image_path}. Vérifiez que le fichier existe dans {self.image_dir} et que les configs sont correctes.")
+            raise FileNotFoundError(f"Image not found during dataset access: {image_path}")
         except Exception as e:
-            print(f"Error opening image {img_path}: {e}. Returning None.")
-            return None
+            print(f"ERREUR (Dataset): Impossible de charger l'image {image_path}: {e}")
+            raise e  # Re-lève l'exception
 
-
-        ann_ids = self.img_to_anns.get(img_id, [])
-        annotations = [self.anns[ann_id] for ann_id in ann_ids]
-
+        # --- Traitement des annotations ---
+        annotation_ids = self.img_to_anns.get(image_id, [])
         boxes = []
-        labels = [] # Pour la détection, toutes les boîtes sont de classe 'texte' (label 1)
+        labels = []
         areas = []
-        iscrowd = [] # Peut être utile pour certains modèles/métriques, ici on met 0 par défaut
 
-        for ann in annotations:
-            # Utiliser 'points' comme source de vérité géométrique
+        for ann_id in annotation_ids:
+            ann = self.annotations[ann_id]
+
+            # Utiliser les 'points' pour dériver la bbox horizontale (source de vérité)
             points = ann.get('points')
-            if not points: continue # Ignorer les annotations sans points
+            bbox = utils.get_bounding_box_from_points(points)  # Format [xmin, ymin, xmax, ymax]
 
-            bbox = polygon_to_bbox(points) # Convertir polygone en bbox [xmin, ymin, xmax, ymax]
-            if bbox is None: continue # Ignorer si la conversion échoue (ex: points colinéaires)
+            if bbox is None:  # Ignorer si la boîte est invalide/dégénérée
+                continue
 
-            # Vérifier que la bbox est dans les limites de l'image (peut arriver avec des annotations bruitées)
+            # S'assurer que les coordonnées sont dans les limites de l'image chargée
             xmin, ymin, xmax, ymax = bbox
-            xmin = max(0, xmin)
-            ymin = max(0, ymin)
-            xmax = min(original_w, xmax)
-            ymax = min(original_h, ymax)
+            # Convertir en float avant max/min pour éviter les erreurs de type si les points sont des entiers
+            # et s'assurer que les dimensions de l'image sont aussi des floats pour la comparaison
+            img_width_f = float(img_width)
+            img_height_f = float(img_height)
+            xmin = max(0.0, float(xmin))
+            ymin = max(0.0, float(ymin))
+            xmax = min(img_width_f, float(xmax))
+            ymax = min(img_height_f, float(ymax))
 
-            # Ignorer les boîtes dégénérées après clipping
+            # Vérifier à nouveau après le clipping si la boîte est toujours valide (aire > 0)
             if xmax <= xmin or ymax <= ymin:
+                # Optionnel : décommenter pour voir les boîtes dégénérées après clipping
+                # print(f"Warning: Box {ann_id} for image {image_id} became degenerate after clipping. Original: {bbox}, Clipped: {[xmin, ymin, xmax, ymax]}")
                 continue
 
             boxes.append([xmin, ymin, xmax, ymax])
-            labels.append(1) # Classe 1 pour 'texte'
-            area = (xmax - xmin) * (ymax - ymin)
-            areas.append(area)
-            iscrowd.append(ann.get('iscrowd', 0)) # Utiliser iscrowd si disponible, sinon 0
+            labels.append(1)  # Classe 1 pour 'text' (classe 0 réservée au fond)
+            # L'aire est calculée sur la bbox clippée
+            areas.append((xmax - xmin) * (ymax - ymin))
 
-        # Créer le dictionnaire de cibles (target)
+        # Conversion en Tensors PyTorch
+        if not boxes:  # S'il n'y a AUCUNE annotation valide pour cette image
+            boxes = torch.empty((0, 4), dtype=torch.float32)
+            labels = torch.empty((0,), dtype=torch.int64)
+            areas = torch.empty((0,), dtype=torch.float32)
+            iscrowd = torch.zeros((0,), dtype=torch.uint8)
+        else:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.int64)
+            areas = torch.tensor(areas, dtype=torch.float32)
+            # Pour TextOCR, nous n'avons pas d'info 'iscrowd', on met tout à 0
+            iscrowd = torch.zeros((len(boxes),), dtype=torch.uint8)
+
+        # Création du dictionnaire 'target' attendu par les modèles torchvision
         target = {}
-        # Convertir en Tensors Float pour les boîtes, Long pour les labels
-        # Utiliser torch.float32 pour les boîtes comme attendu par de nombreux modèles/fonctions de perte
-        target["boxes"] = torch.as_tensor(boxes, dtype=torch.float32) if boxes else torch.empty((0, 4), dtype=torch.float32)
+        target["boxes"] = boxes
+        target["labels"] = labels
+        # Utiliser l'index du dataset comme ID simple ici, bien que l'image_id original soit aussi disponible
+        target["image_id"] = torch.tensor([idx])
+        target["area"] = areas
+        target["iscrowd"] = iscrowd
 
-        # Utiliser torch.int64 pour les labels comme souvent attendu
-        target["labels"] = torch.as_tensor(labels, dtype=torch.int64) if labels else torch.empty((0,), dtype=torch.int64)
-        # Utiliser l'index du dataset comme ID numérique pour ce tenseur
-        target["image_id"] = torch.tensor([idx], dtype=torch.int64)
-        target["area"] = torch.as_tensor(areas, dtype=torch.float32) if areas else torch.empty((0,), dtype=torch.float32)
-        target["iscrowd"] = torch.as_tensor(iscrowd, dtype=torch.uint8) if iscrowd else torch.empty((0,), dtype=torch.uint8)
-
-        # Appliquer les transformations (qui doivent gérer image ET cibles si nécessaire)
-        # Les transforms v2 de torchvision gèrent cela
+        # Appliquer les transformations à l'image
         if self.transforms:
-            # Les transforms v2 attendent image et target (ou une liste/tuple)
-            # Assurez-vous que vos transforms sont compatibles (ex: T.Compose([T.ToImageTensor(), T.ConvertImageDtype()]))
-            # Si redimensionnement, les boîtes doivent être ajustées. T.Resize le fait automatiquement pour les clés connues comme "boxes".
-            image, target = self.transforms(image, target)
-
-
-        # Assurer que les boîtes sont toujours valides après transformations (certaines peuvent devenir minuscules/inversées)
-        if 'boxes' in target and target['boxes'].shape[0] > 0:
-             boxes = target['boxes']
-             # Filtrer les boîtes potentiellement invalides après transformation
-             valid_boxes_mask = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-             target['boxes'] = boxes[valid_boxes_mask]
-             # Filtrer les autres champs correspondants s'ils existent et ont la même taille initiale
-             for key in ['labels', 'area', 'iscrowd']:
-                  if key in target and target[key].shape[0] == valid_boxes_mask.shape[0]:
-                      target[key] = target[key][valid_boxes_mask]
+            # Note: Si les transformations incluent des opérations géométriques (resize, crop),
+            # il faudra aussi transformer les 'boxes' dans la target.
+            # Les transformations standard comme ToTensor, Normalize n'affectent pas les boxes.
+            image = self.transforms(image)
 
         return image, target
+# Fonction Collate pour gérer les lots (batches) d'images et de cibles de tailles variables
+def collate_fn(batch):
+    """
+    Combine une liste de tuples (image, target) en un batch.
+    Nécessaire car les 'targets' (dictionnaires avec des tenseurs) ne peuvent pas
+    être empilés automatiquement par le DataLoader par défaut si le nombre
+    d'annotations varie entre les images.
+    """
+    images = [item[0] for item in batch]
+    targets = [item[1] for item in batch]
+    # Les images sont déjà des tenseurs (ou seront empilées par le DataLoader si ToTensor est appliqué)
+    # On ne les empile pas ici, mais on les retourne comme une liste de tenseurs.
+    # Le moteur d'entraînement s'attend à une liste d'images et une liste de cibles.
+    # Note: Si les images n'ont pas toutes la même taille APRES transformation, il faudra les empiler
+    # ou utiliser une gestion de batch spécifique (padding). Pour Faster R-CNN avec FPN,
+    # les tailles variables sont généralement gérées en interne.
+    return images, targets
 
 
-def get_detection_transforms(is_train=True, target_img_size=(640, 640)):
-    """Crée les transformations pour la détection."""
-    transforms = []
-    # Convertit PIL Image en Tensor PyTorch et normalise les pixels en [0, 1]
-    transforms.append(T.ToImage()) # Correction ici !
-    transforms.append(T.ConvertImageDtype(torch.float32)) # Convertit en float32 [0, 1]
+# Transformations standard pour les modèles torchvision
+# (On n'inclut pas de redimensionnement ici pour l'instant, Faster R-CNN peut gérer différentes tailles,
+# mais un redimensionnement à une taille fixe ou dans une plage peut améliorer les performances/stabilité)
+def get_transform(train):
+    """Applique les transformations de base."""
+    transforms_list = []
+    # Convertit l'image PIL (H, W, C) en tensor FloatTensor (C, H, W) dans [0.0, 1.0]
+    transforms_list.append(transforms.ToTensor())
+    # On pourrait ajouter la normalisation si on utilisait un backbone pré-entraîné,
+    # mais pour un entraînement from scratch, ce n'est pas strictement nécessaire au début.
+    # transforms_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
 
-    # Redimensionnement - Important: T.Resize de v2 ajuste les boîtes automatiquement!
-    if target_img_size:
-        transforms.append(T.Resize(target_img_size, antialias=True)) # Garde ratio aspect initialement? Non, fixe la taille.
+    # Augmentation de données simple pour l'entraînement (Optionnel)
+    # if train:
+    #     transforms_list.append(transforms.RandomHorizontalFlip(0.5))
 
-    if is_train:
-        # Augmentation de données (optionnel mais recommandé)
-        # Exemple: retournement horizontal aléatoire (ajuste les boîtes)
-        transforms.append(T.RandomHorizontalFlip(p=0.5))
-        # Autres augmentations possibles : T.ColorJitter, T.RandomAffine, T.GaussianBlur etc.
-        # Attention: certaines transformations (comme RandomCrop) nécessitent une gestion plus complexe des boîtes.
-        pass
-
-    # Normalisation (valeurs typiques pour modèles entraînés sur ImageNet, même si on entraîne from scratch, c'est un bon point de départ)
-    # Ou utiliser la moyenne/std du dataset TextOCR si calculée. Pour "from scratch" strict, on pourrait ne pas normaliser ou utiliser 0.5/0.5
-    # transforms.append(T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])) # Optionnel
-
-    return T.Compose(transforms)
+    return transforms.Compose(transforms_list)
 
 
-def collate_fn_detection(batch):
-    """Fonction de collation pour DataLoader de détection.
-       Gère les images de tailles potentiellement différentes (avant transfo)
-       et les nombres variables de boîtes par image. Filtre les None."""
-    # Filtrer les échantillons None (qui résultent d'erreurs de chargement)
-    batch = list(filter(lambda x: x is not None, batch))
-    if not batch: # Si le batch est vide après filtrage
-        return None, None # Ou lever une exception/retourner des tenseurs vides
+# Fonction pour créer les DataLoaders
+def create_dataloaders(batch_size):
+    """Crée les DataLoaders pour l'entraînement et la validation."""
 
-    images, targets = zip(*batch)
-    # Les images devraient avoir la même taille après les transformations (si Resize est utilisé)
-    # Empiler les images dans un batch
-    images = torch.stack(images, 0)
-    # Les cibles sont des listes de dictionnaires, elles restent comme ça pour la plupart des modèles de détection
-    return images, list(targets)
-
-
-def create_detection_dataloaders(train_json, val_json, train_img_dir, val_img_dir, batch_size, num_workers, img_size):
-    """Crée les DataLoaders pour l'entraînement et la validation de la détection."""
-
-    train_transforms = get_detection_transforms(is_train=True, target_img_size=img_size)
-    val_transforms = get_detection_transforms(is_train=False, target_img_size=img_size)
-
-    train_dataset = TextOCRDatasetDetection(
-        json_path=train_json,
-        img_dir=train_img_dir,
-        transforms=train_transforms,
-        target_img_size=img_size # Redondant si déjà dans transforms, mais OK
+    train_dataset = TextOCRDetectionDataset(
+        annotation_file=config.TRAIN_ANNOTATION_FILE,
+        image_dir=config.TRAIN_IMAGE_DIR,
+        transforms=get_transform(train=True)
     )
-    val_dataset = TextOCRDatasetDetection(
-        json_path=val_json,
-        img_dir=val_img_dir,
-        transforms=val_transforms,
-        target_img_size=img_size # Redondant
+
+    val_dataset = TextOCRDetectionDataset(
+        annotation_file=config.VAL_ANNOTATION_FILE,
+        image_dir=config.VAL_IMAGE_DIR, # Utiliser le bon dossier pour la validation
+        transforms=get_transform(train=False)
     )
+
+    print(f"Taille du Dataset d'entraînement: {len(train_dataset)}")
+    print(f"Taille du Dataset de validation: {len(val_dataset)}")
+
+    # Si le dataset est vide, c'est probablement un problème de chemin ou de filtre
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        raise ValueError("Un des datasets est vide. Vérifiez les chemins d'accès aux données et aux annotations dans config.py, ainsi que la structure des fichiers JSON.")
+
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_fn_detection,
-        pin_memory=True # Améliore potentiellement le transfert CPU -> GPU
+        num_workers=4, # Ajuster selon votre CPU/système (0 sous Windows peut être plus stable)
+        collate_fn=collate_fn,
+        pin_memory=True # Accélère le transfert CPU -> GPU si la mémoire le permet
     )
+
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size, # Souvent plus petit ou égal au batch size d'entraînement
+        batch_size=batch_size, # Souvent on peut utiliser un batch_size plus grand en validation
         shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn_detection,
+        num_workers=4,
+        collate_fn=collate_fn,
         pin_memory=True
     )
 
-    print(f"Train DataLoader: {len(train_loader)} batches, {len(train_dataset)} samples.")
-    print(f"Validation DataLoader: {len(val_loader)} batches, {len(val_dataset)} samples.")
-
     return train_loader, val_loader
 
-# Exemple d'utilisation (pour tester)
 if __name__ == '__main__':
-    print("Testing TextOCR Dataset and DataLoader creation...")
-    set_seed(config.SEED)
+    # Petit test pour vérifier que le chargement fonctionne
+    print("Test du DataLoader...")
+    train_loader, val_loader = create_dataloaders(batch_size=2)
 
-    # Utiliser les chemins de config.py
-    train_json_path = config.TRAIN_JSON
-    train_image_directory = config.TRAIN_IMG_DIR
-    val_json_path = config.VAL_JSON
-    val_image_directory = config.VAL_IMG_DIR
-    batch_sz = config.BATCH_SIZE
-    num_w = config.NUM_WORKERS
-    img_sz = config.IMG_SIZE
-
+    print("\nTest récupération d'un batch d'entraînement:")
     try:
-        train_loader, val_loader = create_detection_dataloaders(
-            train_json=train_json_path,
-            val_json=val_json_path,
-            train_img_dir=train_image_directory,
-            val_img_dir=val_image_directory,
-            batch_size=batch_sz,
-            num_workers=num_w,
-            img_size=img_sz
-        )
-
-        print("\nDataLoaders created successfully.")
-
-        # Afficher un batch d'entraînement pour vérification
-        print("\nFetching one batch from train_loader...")
         images, targets = next(iter(train_loader))
-
-        if images is not None and targets is not None:
-            print("Batch fetched successfully:")
-            print(f"Images shape: {images.shape}") # Devrait être [batch_size, C, H, W]
-            print(f"Targets length: {len(targets)}") # Devrait être batch_size
-            print("Sample target (first item in batch):")
-            # Afficher les clés et formes des tenseurs dans la première cible
-            if targets:
-                first_target = targets[0]
-                for key, value in first_target.items():
-                     if isinstance(value, torch.Tensor):
-                         print(f"  - {key}: shape={value.shape}, dtype={value.dtype}")
-                     else:
-                         print(f"  - {key}: {value}")
-
-                # Visualiser la première image du batch avec ses boîtes ground truth
-                print("\nVisualizing first image of the batch...")
-                from utils import visualize_detection # Importer ici pour éviter dépendance circulaire si appelé directement
-                # Dénormaliser l'image si la normalisation a été appliquée dans les transforms
-                # (Ici, on n'a pas normalisé dans get_detection_transforms pour l'instant)
-                # Convertir l'image tensor (C, H, W) en format (H, W, C) pour matplotlib
-                img_to_show = images[0].permute(1, 2, 0).cpu().numpy()
-                # Les pixels sont en [0, 1], matplotlib les gère. Si >1 ou négatif, clipper/ajuster.
-                img_to_show = np.clip(img_to_show, 0, 1)
-
-                # Créer un chemin temporaire pour la visualisation
-                vis_dir = os.path.join(config.BASE_PROJECT_DIR, "visualizations")
-                vis_path = os.path.join(vis_dir, "train_batch_sample_detection.png")
-
-                 # Besoin de convertir les coordonnées des boîtes si elles ont été normalisées ou si l'image a été redimensionnée
-                 # Ici, les transforms T.Resize ajustent les boîtes automatiquement aux coordonnées de l'image redimensionnée.
-                visualize_detection(
-                    image_path=None, # On fournit directement l'image traitée
-                    targets=first_target,
-                    predictions=None,
-                    output_path=vis_path
-                )
-                # Pour afficher l'image directement à partir du tensor:
-                fig, ax = plt.subplots(1)
-                ax.imshow(img_to_show)
-                for box in first_target['boxes']:
-                    xmin, ymin, xmax, ymax = box.cpu().numpy()
-                    rect = patches.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin, linewidth=1, edgecolor='g', facecolor='none')
-                    ax.add_patch(rect)
-                plt.axis('off')
-                plt.savefig(vis_path.replace(".png", "_direct.png"))
-                plt.close(fig)
-                print(f"Sample visualization saved to {vis_path} and {vis_path.replace('.png', '_direct.png')}")
-
-
-            else:
-                 print("No targets found in the first batch item.")
-
-        else:
-            print("Failed to fetch a valid batch. Check dataset/collate function.")
-
-    except FileNotFoundError as e:
-        print(f"\nError: {e}")
-        print("Please ensure the paths in config.py are correct and the data exists.")
+        print(f"Nombre d'images dans le batch: {len(images)}")
+        print(f"Type image[0]: {type(images[0])}, Shape: {images[0].shape}")
+        print(f"Nombre de cibles dans le batch: {len(targets)}")
+        print(f"Type target[0]: {type(targets[0])}")
+        print(f"Clés target[0]: {targets[0].keys()}")
+        print(f"Exemple boxes target[0]: {targets[0]['boxes'].shape}")
+        print(f"Exemple labels target[0]: {targets[0]['labels'].shape}")
     except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Erreur lors de la récupération d'un batch : {e}")
+        print("Vérifiez les chemins dans config.py et l'intégrité des fichiers JSON/images.")
+
+
+    print("\nTest récupération d'un batch de validation:")
+    try:
+        images_val, targets_val = next(iter(val_loader))
+        print(f"Nombre d'images dans le batch val: {len(images_val)}")
+        print(f"Shape image_val[0]: {images_val[0].shape}")
+        print(f"Nombre de cibles dans le batch val: {len(targets_val)}")
+    except Exception as e:
+        print(f"Erreur lors de la récupération d'un batch de validation : {e}")
+
+    print("\nTest de data_loader.py terminé.")

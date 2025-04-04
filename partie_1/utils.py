@@ -1,13 +1,12 @@
+# utils.py
 import torch
 import random
 import numpy as np
 import os
-import shutil
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from PIL import Image
+import config # Importer notre configuration
+from collections import OrderedDict # Ajout pour DataParallel
 
-def set_seed(seed=42):
+def set_seed(seed=config.RANDOM_SEED):
     """Fixe les graines aléatoires pour la reproductibilité."""
     random.seed(seed)
     np.random.seed(seed)
@@ -15,149 +14,144 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        # Les opérations cudnn peuvent être non déterministes, ces lignes aident mais ne garantissent pas à 100%
+        # Attention: Peut ralentir l'entraînement mais améliore la reproductibilité
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.benchmark = False # Benchmark à False améliore la reproductibilité
     print(f"Random seed set to {seed}")
 
-def save_checkpoint(state, is_best, checkpoint_dir, filename='checkpoint.pth.tar', best_filename='model_best_detection.pth.tar'):
-    """Sauvegarde l'état de l'entraînement."""
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-        print(f"Created checkpoint directory: {checkpoint_dir}")
+def save_checkpoint(state, filename="checkpoint.pth.tar"):
+    """
+    Sauvegarde l'état de l'entraînement.
 
-    filepath = os.path.join(checkpoint_dir, filename)
+    Args:
+        state (dict): Dictionnaire contenant l'état à sauvegarder (epoch, state_dict, optimizer,
+                      best_f1_score, lr_scheduler, etc.).
+        filename (str): Nom du fichier de checkpoint.
+    """
+    filepath = os.path.join(config.CHECKPOINT_DIR, filename)
+    print(f"=> Saving checkpoint to {filepath}")
+    # Utiliser cpu() pour éviter les problèmes de chargement entre devices si nécessaire,
+    # mais généralement .pth.tar peut être chargé sur n'importe quel device avec map_location.
     torch.save(state, filepath)
-    print(f"Checkpoint saved to {filepath}")
 
-    if is_best:
-        best_filepath = os.path.join(checkpoint_dir, best_filename)
-        shutil.copyfile(filepath, best_filepath)
-        print(f"Best model saved to {best_filepath}")
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
+    """
+    Charge un checkpoint et retourne l'époque de départ et la meilleure métrique (F1 si disponible).
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, scaler=None, device='cpu'):
-    """Charge un checkpoint."""
+    Args:
+        checkpoint_path (str): Chemin vers le fichier de checkpoint.
+        model (torch.nn.Module): Modèle dans lequel charger les poids.
+        optimizer (torch.optim.Optimizer, optional): Optimiseur dont charger l'état.
+        scheduler (torch.optim.lr_scheduler._LRScheduler, optional): Scheduler dont charger l'état.
+
+    Returns:
+        tuple: (start_epoch, best_metric) où
+               - start_epoch (int): L'époque à laquelle reprendre l'entraînement (+1 par rapport à celle sauvegardée).
+               - best_metric (float): La meilleure métrique F1-Score enregistrée (ou 0.0 si non trouvée).
+    """
     if not os.path.exists(checkpoint_path):
-        print(f"Checkpoint file not found: {checkpoint_path}")
-        return None, 0, float('inf') # Renvoie None pour l'état, époque 0, et perte infinie
+        print(f"=> No checkpoint found at '{checkpoint_path}'")
+        # Retourner 0.0 comme meilleur F1 score par défaut si on commence de zéro
+        return 0, 0.0
 
-    print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    print(f"=> Loading checkpoint '{checkpoint_path}'")
+    # Charger sur le device configuré
+    checkpoint = torch.load(checkpoint_path, map_location=config.DEVICE)
 
-    # Gestion des modèles DataParallel/DistributedDataParallel
-    state_dict = checkpoint['state_dict']
-    # Supprimer le préfixe 'module.' si le modèle a été sauvegardé avec DataParallel
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        name = k[7:] if k.startswith('module.') else k
-        new_state_dict[name] = v
+    # --- Chargement de l'état du modèle ---
+    state_dict = checkpoint.get('state_dict')
+    if not state_dict:
+        print("ERREUR: Checkpoint ne contient pas 'state_dict'. Impossible de charger le modèle.")
+        return 0, 0.0
 
-    model.load_state_dict(new_state_dict)
-    print("Model weights loaded successfully.")
+    # Gérer le préfixe 'module.' ajouté par DataParallel ou DDP
+    if list(state_dict.keys())[0].startswith('module.'):
+        print("   Detected model saved with DataParallel/DDP, removing 'module.' prefix.")
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name = k[7:] # remove `module.`
+            new_state_dict[name] = v
+        model.load_state_dict(new_state_dict)
+    else:
+        model.load_state_dict(state_dict)
+    print("   Model state loaded successfully.")
 
-    start_epoch = checkpoint.get('epoch', 0)
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-
+    # --- Chargement de l'état de l'optimiseur ---
     if optimizer and 'optimizer' in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint['optimizer'])
-            print("Optimizer state loaded successfully.")
+            print("   Optimizer state loaded successfully.")
+            # Déplacer l'état de l'optimiseur sur le bon device
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(config.DEVICE)
         except Exception as e:
-             print(f"Could not load optimizer state: {e}. Starting optimizer from scratch.")
+            print(f"   WARNING: Could not load optimizer state: {e}. Optimizer starts from scratch.")
+    elif optimizer:
+         print("   Optimizer state not found in checkpoint. Optimizer starts from scratch.")
 
-
-    if scaler and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
+    # --- Chargement de l'état du Scheduler ---
+    if scheduler and 'lr_scheduler' in checkpoint:
         try:
-            scaler.load_state_dict(checkpoint['scaler'])
-            print("AMP Scaler state loaded successfully.")
+            scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            print("   Scheduler state loaded successfully.")
         except Exception as e:
-            print(f"Could not load AMP Scaler state: {e}. Initializing new scaler.")
+             print(f"   WARNING: Could not load scheduler state: {e}. Scheduler starts from scratch.")
+    elif scheduler:
+        print("   Scheduler state not found in checkpoint. Scheduler starts from scratch.")
+
+    # --- Récupération de l'époque et de la meilleure métrique ---
+    start_epoch = checkpoint.get('epoch', -1) + 1 # +1 pour commencer l'époque *suivante*
+    # Prioriser la nouvelle métrique 'best_f1_score'
+    # Mettre 0.0 comme défaut pour F1 score
+    best_f1_score = checkpoint.get('best_f1_score', 0.0)
+
+    # (Optionnel: Si vous voulez aussi gérer l'ancienne métrique 'best_metric' pour la compatibilité)
+    # if 'best_f1_score' not in checkpoint and 'best_metric' in checkpoint:
+    #    print("   WARNING: Using old 'best_metric' from checkpoint as F1 score was not found.")
+    #    best_f1_score = checkpoint.get('best_metric', 0.0) # Assumer que l'ancienne métrique était un score (pas une perte)
+
+    print(f"=> Loaded checkpoint '{checkpoint_path}' (resume from epoch {start_epoch}, best F1 score recorded: {best_f1_score:.4f})")
+    return start_epoch, best_f1_score # Retourne l'époque de début et le meilleur F1
 
 
-    print(f"Checkpoint loaded. Resuming from epoch {start_epoch + 1}, Best validation loss so far: {best_val_loss:.4f}")
-    return model, optimizer, scaler, start_epoch, best_val_loss
+# --- Fonctions spécifiques aux données TextOCR (inchangées) ---
 
-
-def polygon_to_bbox(points):
-    """Convertit une liste de points [x1, y1, x2, y2, ...] en une bbox [xmin, ymin, xmax, ymax]."""
+def get_bounding_box_from_points(points):
+    """
+    Calcule la boîte englobante horizontale (xmin, ymin, xmax, ymax)
+    à partir d'une liste de points [x1, y1, x2, y2, ...].
+    """
     if not points or len(points) < 2:
         return None
-    xs = points[0::2]
-    ys = points[1::2]
-    if not xs or not ys: # Au cas où il n'y aurait qu'un seul point
-        return None
-    xmin = min(xs)
-    ymin = min(ys)
-    xmax = max(xs)
-    ymax = max(ys)
-    # Vérification de validité (largeur et hauteur > 0)
-    if xmax <= xmin or ymax <= ymin:
-        return None
-    return [xmin, ymin, xmax, ymax]
 
-def visualize_detection(image_path, targets, predictions=None, output_path=None, score_threshold=0.5):
-    """Visualise les boîtes englobantes (ground truth et/ou prédictions) sur une image."""
-    try:
-        img = Image.open(image_path).convert("RGB")
-        fig, ax = plt.subplots(1, figsize=(12, 9))
-        ax.imshow(img)
-        plt.axis('off')
+    # Convertir en numpy array et trouver min/max pour chaque axe
+    pts_array = np.array(points).reshape(-1, 2)
+    x_min, y_min = pts_array.min(axis=0)
+    x_max, y_max = pts_array.max(axis=0)
 
-        # Afficher les boîtes Ground Truth (en vert)
-        if targets and 'boxes' in targets:
-            for box in targets['boxes']:
-                xmin, ymin, xmax, ymax = box
-                rect = patches.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
-                                         linewidth=2, edgecolor='g', facecolor='none')
-                ax.add_patch(rect)
+    # Vérifier que la boîte a une aire > 0 (pas dégénérée)
+    if x_max <= x_min or y_max <= y_min:
+       # Commenté pour éviter trop de logs si ça arrive souvent
+       # print(f"Warning: Degenerate bounding box calculated from points {points}. Min/Max: ({x_min}, {y_min}), ({x_max}, {y_max})")
+       return None # Retourner None pour indiquer une boîte invalide
 
-        # Afficher les boîtes Prédites (en rouge)
-        if predictions and 'boxes' in predictions:
-             scores = predictions.get('scores', [1.0] * len(predictions['boxes'])) # Default score 1 if not provided
-             for i, box in enumerate(predictions['boxes']):
-                 if scores[i] >= score_threshold:
-                     xmin, ymin, xmax, ymax = box
-                     rect = patches.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
-                                              linewidth=2, edgecolor='r', facecolor='none')
-                     ax.add_patch(rect)
-                     if 'labels' in predictions: # Optionnel: afficher label/score
-                          label = predictions['labels'][i]
-                          score = scores[i]
-                          ax.text(xmin, ymin - 5, f'{label}: {score:.2f}', color='red', fontsize=8, bbox=dict(facecolor='white', alpha=0.5, pad=0))
+    return [float(x_min), float(y_min), float(x_max), float(y_max)] # Assurer float pour compatibilité tenseurs
 
+def get_horizontal_bbox_from_textocr_bbox(textocr_bbox):
+    """
+    Convertit le format TextOCR [xmin, ymin, width, height]
+    en [xmin, ymin, xmax, ymax].
+    """
+    x_min, y_min, width, height = textocr_bbox
+    # Vérifier validité
+    if width <= 0 or height <= 0:
+       # print(f"Warning: Degenerate bbox from TextOCR format {textocr_bbox}")
+       return None # Retourner None pour indiquer une boîte invalide
+    x_max = x_min + width
+    y_max = y_min + height
+    # Assurer float pour compatibilité tenseurs
+    return [float(x_min), float(y_min), float(x_max), float(y_max)]
 
-        if output_path:
-            if not os.path.exists(os.path.dirname(output_path)):
-                 os.makedirs(os.path.dirname(output_path))
-            plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
-            print(f"Visualization saved to {output_path}")
-        else:
-            plt.show()
-        plt.close(fig)
-
-    except FileNotFoundError:
-        print(f"Error: Image file not found at {image_path}")
-    except Exception as e:
-        print(f"Error during visualization: {e}")
-
-# --- Fonctions de Métriques (Simplifiées pour le début) ---
-# Pour la détection, une métrique clé est l'Intersection over Union (IoU)
-def calculate_iou(box1, box2):
-    """Calcule l'Intersection over Union (IoU) entre deux boîtes [xmin, ymin, xmax, ymax]."""
-    x1_inter = max(box1[0], box2[0])
-    y1_inter = max(box1[1], box2[1])
-    x2_inter = min(box1[2], box2[2])
-    y2_inter = min(box1[3], box2[3])
-
-    inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
-
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-
-    union_area = box1_area + box2_area - inter_area
-
-    iou = inter_area / union_area if union_area > 0 else 0.0
-    return iou
-
-# Note: Une évaluation complète (mAP) nécessiterait une logique plus complexe
-# pour apparier prédictions et ground truths basées sur l'IoU et calculer Precision/Recall.
+# On pourrait ajouter ici des fonctions de visualisation plus tard

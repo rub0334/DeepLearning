@@ -1,262 +1,151 @@
+# train_detector.py
 import torch
 import torch.optim as optim
-import torch.optim.lr_scheduler as lr_scheduler
-import os
+from torch.optim.lr_scheduler import StepLR
 import time
-import argparse # Utilisé pour les options de ligne de commande
-import numpy as np
-from PIL import Image
+import os
+import sys # Ajout pour sys.exit en cas d'erreur critique
 
-# Importer depuis nos modules locaux
-import config
-from utils import set_seed, save_checkpoint, load_checkpoint, visualize_detection
-from data_loader import create_detection_dataloaders
-from model_detection import build_detection_model
-from engine_detection import train_one_epoch, evaluate
+import config       # Notre configuration
+import utils        # Nos utilitaires (seed, checkpointing)
+import data_loader  # Notre chargement de données
+import model_detection # Notre définition de modèle
+import engine_detection # Nos boucles train/eval
 
 def main():
-    # --- Configuration et Initialisation ---
-    parser = argparse.ArgumentParser(description="Train Text Detection Model 'From Scratch' on TextOCR")
-    # Arguments pour remplacer ou compléter config.py
-    parser.add_argument('--config_lr', type=float, default=config.LEARNING_RATE, help='Learning rate')
-    parser.add_argument('--config_epochs', type=int, default=config.NUM_EPOCHS, help='Number of epochs')
-    parser.add_argument('--config_batch_size', type=int, default=config.BATCH_SIZE, help='Batch size')
-    parser.add_argument('--resume', type=str, default=None, help='Path to specific checkpoint to resume training from')
-    parser.add_argument('--resume-best', action='store_true', # <<< NOUVEL ARGUMENT
-                        help='Resume training from the best saved model (model_best_detection.pth.tar) if it exists')
-    parser.add_argument('--vis_freq', type=int, default=5, help='Frequency (in epochs) to save visualization samples')
-    # Suppression de l'ancien argument '--resume_best' qui était redondant avec '--resume-best' action='store_true'
-    args = parser.parse_args()
+    # 1. Initialisation et Configuration
+    print("--- Démarrage de l'entraînement du détecteur de texte ---")
+    utils.set_seed(config.RANDOM_SEED) # Fixer les graines pour la reproductibilité
+    device = config.DEVICE
+    print(f"Utilisation du device: {device}")
 
-    # Appliquer les arguments de la ligne de commande
-    learning_rate = args.config_lr
-    num_epochs = args.config_epochs
-    batch_size = args.config_batch_size
+    # 2. Chargement des Données
+    print("Chargement des données...")
+    try:
+        train_loader, val_loader = data_loader.create_dataloaders(config.BATCH_SIZE)
+    except ValueError as e:
+        print(f"Erreur critique lors de la création des DataLoaders: {e}")
+        sys.exit(1) # Arrêter si les datasets sont vides
 
-    # Fixer les graines pour la reproductibilité
-    set_seed(config.SEED)
+    # 3. Initialisation du Modèle
+    print("Initialisation du modèle...")
+    model = model_detection.get_detection_model(num_classes=config.NUM_CLASSES)
+    model.to(device) # Déplacer le modèle sur le bon device
 
-    # Sélection du device (GPU si disponible)
-    device = torch.device(config.DEVICE)
-    print(f"Using device: {device}")
-    if config.DEVICE == "cuda":
-        try:
-            print(f"CUDA Device Name: {torch.cuda.get_device_name(0)}")
-            print(f"CUDA Capability: {torch.cuda.get_device_capability(0)}")
-        except Exception as e:
-             print(f"Could not get CUDA device details: {e}")
+    # 4. Initialisation de l'Optimiseur et du Scheduler
+    print("Initialisation de l'optimiseur et du scheduler...")
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(params, lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    lr_scheduler = StepLR(optimizer, step_size=config.LR_STEP_SIZE, gamma=config.LR_GAMMA)
 
-
-    # Créer les DataLoaders
-    print("Creating DataLoaders...")
-    train_loader, val_loader = create_detection_dataloaders(
-        train_json=config.TRAIN_JSON,
-        val_json=config.VAL_JSON,
-        train_img_dir=config.TRAIN_IMG_DIR,
-        val_img_dir=config.VAL_IMG_DIR,
-        batch_size=batch_size,
-        num_workers=config.NUM_WORKERS,
-        img_size=config.IMG_SIZE # Assurez-vous que IMG_SIZE est défini dans config.py
-    )
-    if not train_loader or not val_loader:
-        print("Error creating dataloaders. Exiting.")
-        return # Stop execution if dataloaders fail
-
-    # Construire le modèle de détection
-    print("Building detection model...")
-    # Utiliser NUM_DETECTION_CLASSES de config.py (ex: 1 pour 'texte', le background est implicite dans la perte BCE)
-    model = build_detection_model(num_classes=config.NUM_DETECTION_CLASSES) # Assurez-vous que NUM_DETECTION_CLASSES=1
-    model.to(device)
-
-    # Optimiseur
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=config.WEIGHT_DECAY)
-
-    # Scheduler de taux d'apprentissage
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1) # Exemple
-
-    # Précision mixte (AMP)
-    use_amp_actual = config.USE_AMP and device.type == 'cuda'
-    scaler = torch.amp.GradScaler(enabled=use_amp_actual)
-    if config.USE_AMP and not use_amp_actual:
-        print("Warning: AMP is enabled in config but no CUDA device found or CUDA unavailable. Running without AMP.")
-    elif not config.USE_AMP:
-        print("AMP not enabled in config.")
-    print(f"Automatic Mixed Precision (AMP) active: {scaler.is_enabled()}")
-
-    # --- Logique de reprise depuis un checkpoint ---
-    start_epoch = 0
-    best_val_loss = float('inf')
-    checkpoint_to_load = None
-
-    # 1. Priorité à --resume s'il est spécifié
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print(f"Attempting to resume from specified checkpoint: {args.resume}")
-            checkpoint_to_load = args.resume
-        else:
-            print(f"Warning: Specified resume checkpoint not found at '{args.resume}'.")
-
-    # 2. Sinon (pas de --resume ou fichier non trouvé), essayer --resume-best si demandé
-    if checkpoint_to_load is None and args.resume_best:
-        best_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, 'model_best_detection.pth.tar')
-        if os.path.isfile(best_checkpoint_path):
-            print(f"Attempting to resume from best checkpoint: {best_checkpoint_path}")
-            checkpoint_to_load = best_checkpoint_path
-        else:
-            print("Warning: --resume-best specified, but best checkpoint ('model_best_detection.pth.tar') not found.")
-
-    # 3. Charger le checkpoint sélectionné (s'il y en a un)
-    if checkpoint_to_load:
-        try:
-            model, optimizer, scaler, start_epoch, best_val_loss = load_checkpoint(
-                checkpoint_to_load, model, optimizer, scaler, device
-            )
-            print(f"Successfully resumed training from epoch {start_epoch + 1}. Best loss recorded: {best_val_loss:.4f}")
-
-            # !!! IMPORTANT: Reprise de l'état du scheduler !!!
-            # L'utilitaire load_checkpoint actuel ne charge PAS l'état du scheduler.
-            # Pour une reprise parfaite, il faudrait sauvegarder et charger scheduler.state_dict().
-            # Workaround pour StepLR/Cosine etc.: Appeler step() le bon nombre de fois.
-            print(f"Attempting to restore scheduler state for epoch {start_epoch}...")
-            # S'assurer que le scheduler existe avant de le step
-            if scheduler:
-                for _ in range(start_epoch):
-                    scheduler.step()
-                print(f"Scheduler stepped {start_epoch} times. Current LR: {optimizer.param_groups[0]['lr']:.1e}")
-            else:
-                print("No scheduler defined, skipping scheduler state restoration.")
-
-        except Exception as e:
-            print(f"Error loading checkpoint '{checkpoint_to_load}': {e}")
-            print("Starting training from scratch.")
-            start_epoch = 0
-            best_val_loss = float('inf')
-            # Réinitialiser scaler au cas où le chargement a échoué partiellement
-            scaler = torch.amp.GradScaler(enabled=use_amp_actual)
+    # 5. Initialisation pour la Précision Mixte
+    use_amp = torch.cuda.is_available() and config.DEVICE == torch.device("cuda")
+    scaler = None
+    if use_amp:
+        scaler = torch.amp.GradScaler()
+        print("Utilisation de la Précision Mixte Automatique (AMP) via torch.amp.")
     else:
-        print("No valid checkpoint specified or found. Starting training from scratch.")
-        start_epoch = 0
-        best_val_loss = float('inf')
-    # --- Fin de la logique de reprise ---
+        print("Précision Mixte non utilisée.")
 
+    # 6. Chargement d'un Checkpoint (si existant)
+    start_epoch = 0
+    best_f1_score = 0.0
+    checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "last_checkpoint.pth.tar")
+    scheduler_to_load = lr_scheduler # Garder une référence au scheduler
 
-    # Créer les répertoires si nécessaire
-    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-    vis_dir = os.path.join(config.BASE_PROJECT_DIR, "visualizations_detection") # Nom spécifique
-    os.makedirs(vis_dir, exist_ok=True)
-    print(f"Checkpoints will be saved in: {config.CHECKPOINT_DIR}")
-    print(f"Visualizations will be saved in: {vis_dir}")
+    if os.path.exists(checkpoint_path):
+        print(f"Reprise depuis le checkpoint: {checkpoint_path}")
+        # Passer le scheduler à load_checkpoint
+        start_epoch, best_f1_score = utils.load_checkpoint(checkpoint_path, model, optimizer, scheduler=scheduler_to_load)
+        print(f"Reprise à l'époque {start_epoch}. Meilleur F1 Score précédent: {best_f1_score:.4f}")
+        # Important: S'assurer que le lr_scheduler a été avancé si non chargé depuis checkpoint
+        # La fonction load_checkpoint modifiée devrait gérer ça via scheduler.load_state_dict()
 
+    # 7. Boucle d'Entraînement Principale
+    print("\n--- Début de la boucle d'entraînement ---")
+    start_time = time.time() # S'assurer qu'elle est définie ici
 
-    # --- Boucle d'Entraînement ---
-    print(f"\nStarting training from epoch {start_epoch + 1}...")
-    start_training_time = time.time()
-
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(start_epoch, config.NUM_EPOCHS):
         epoch_start_time = time.time()
 
-        # Entraînement
-        train_loss = train_one_epoch(
-            model, optimizer, train_loader, device, epoch, scaler
-            # grad_clip_norm est lu depuis config via engine_detection
-        )
+        # --- Phase d'Entraînement ---
+        try:
+            # Vérifier si la fonction existe avant de l'appeler
+            if not hasattr(engine_detection, 'train_one_epoch'):
+                 print("ERREUR CRITIQUE: La fonction 'train_one_epoch' est manquante dans engine_detection.py!")
+                 sys.exit(1)
 
-        # Validation
-        val_loss = evaluate(
-            model, val_loader, device
-        )
+            train_loss = engine_detection.train_one_epoch(
+                model, optimizer, train_loader, device, epoch, scaler
+            )
+        except Exception as e_train:
+             print(f"\n--- ERREUR PENDANT L'ENTRAINEMENT (Epoch {epoch+1}) ---")
+             print(f"{e_train}")
+             # Optionnel: Sauvegarder l'état actuel pour débogage
+             # utils.save_checkpoint({...}, filename="error_state.pth.tar")
+             raise e_train # Relancer l'erreur pour arrêter proprement
 
-        # Mise à jour du scheduler
-        current_lr = optimizer.param_groups[0]['lr'] # Get LR avant step
-        if scheduler:
-            if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
-                 scheduler.step(val_loss)
-            else:
-                 scheduler.step() # Pour StepLR, CosineAnnealingLR, etc.
-        new_lr = optimizer.param_groups[0]['lr'] # Get LR après step
+
+        # --- Phase d'Évaluation des Métriques ---
+        try:
+             # Vérifier si la fonction existe avant de l'appeler
+            if not hasattr(engine_detection, 'evaluate_metrics'):
+                 print("ERREUR CRITIQUE: La fonction 'evaluate_metrics' est manquante dans engine_detection.py!")
+                 sys.exit(1)
+
+            eval_metrics = engine_detection.evaluate_metrics(
+                model, val_loader, device, epoch
+            )
+            current_f1 = eval_metrics['f1_score']
+        except Exception as e_eval:
+            print(f"\n--- ERREUR PENDANT L'EVALUATION (Epoch {epoch+1}) ---")
+            print(f"{e_eval}")
+            # Décider si on continue ou arrête
+            # On pourrait juste logguer l'erreur et continuer l'entraînement suivant
+            current_f1 = 0.0 # Mettre une valeur par défaut pour éviter erreur plus loin
+            # raise e_eval # Décommenter pour arrêter en cas d'erreur d'évaluation
+
+        # --- Mise à jour du Scheduler ---
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Taux d'apprentissage pour la prochaine époque: {current_lr:.6f}")
+
+        # --- Sauvegarde du Checkpoint ---
+        is_best = current_f1 > best_f1_score
+        if is_best:
+            best_f1_score = current_f1
+            print(f"** Nouveau meilleur F1-Score de validation: {best_f1_score:.4f} **")
+            utils.save_checkpoint({
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_f1_score': best_f1_score,
+                'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler else None
+            }, filename="best_model.pth.tar")
+
+        if (epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == config.NUM_EPOCHS:
+            utils.save_checkpoint({
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_f1_score': best_f1_score,
+                'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler else None
+            }, filename="last_checkpoint.pth.tar")
 
         epoch_duration = time.time() - epoch_start_time
-        print(f"Epoch {epoch+1}/{num_epochs} finished in {epoch_duration:.2f}s. Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {new_lr:.1e}")
+        print(f"Epoch {epoch + 1} terminée en {epoch_duration:.2f} secondes.")
+        print("-" * 50)
 
-        if new_lr != current_lr:
-            print(f"Learning rate updated to {new_lr:.1e}")
-
-        # Sauvegarde du checkpoint
-        is_best = val_loss < best_val_loss
-        if is_best:
-            best_val_loss = val_loss
-            print(f"🎉 New best model found with validation loss: {best_val_loss:.4f}")
-
-        # Préparer l'état à sauvegarder (inclure scaler si AMP est utilisé)
-        checkpoint_state = {
-            'epoch': epoch + 1, # Sauvegarder l'époque *suivante* à démarrer
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'best_val_loss': best_val_loss,
-            'scaler': scaler.state_dict() if scaler and scaler.is_enabled() else None, # Sauvegarder scaler si activé
-            # Optionnel: Sauvegarder l'état du scheduler pour une reprise parfaite
-            # 'scheduler': scheduler.state_dict() if scheduler else None,
-            'config': { # Sauvegarder les hyperparams utilisés peut être utile
-                 'lr': learning_rate,
-                 'batch_size': batch_size,
-                 'img_size': config.IMG_SIZE,
-                 'num_epochs': num_epochs,
-                 'seed': config.SEED,
-                 'num_det_classes': config.NUM_DETECTION_CLASSES,
-                 'weight_decay': config.WEIGHT_DECAY
-            }
-        }
-
-        # Sauvegarder le checkpoint
-        save_last = True # Toujours sauvegarder le dernier checkpoint
-        save_best = is_best # Sauvegarder si c'est le meilleur
-
-        if save_last:
-            save_checkpoint(
-                checkpoint_state,
-                is_best=False, # Ne pas écraser le meilleur avec celui-ci
-                checkpoint_dir=config.CHECKPOINT_DIR,
-                filename=f'checkpoint_last.pth.tar'
-            )
-
-        if save_best:
-             save_checkpoint(
-                 checkpoint_state,
-                 is_best=True, # Va sauvegarder comme model_best_detection.pth.tar
-                 checkpoint_dir=config.CHECKPOINT_DIR
-                 # Le nom de fichier 'model_best...' est géré dans save_checkpoint si is_best=True
-             )
-
-        # Visualisation (décommentée mais nécessite une fonction visualize_sample_predictions adaptée)
-        # Attention: la fonction visualize_sample_predictions fournie précédemment
-        # avait un post-traitement simplifié qui n'est PAS compatible avec la sortie FPN
-        # (cls_logits: List[N,HxW,C], bbox_pred: List[N,HxW,4]).
-        # Il faudrait la réécrire complètement pour gérer la sortie FPN (décodage, NMS multi-niveau).
-        # Pour l'instant, on la garde commentée.
-        # if (epoch + 1) % args.vis_freq == 0 or is_best:
-        #    print(f"Generating visualization samples for epoch {epoch+1}...")
-        #    # visualize_sample_predictions_fpn(model, val_loader, device, vis_dir, epoch + 1) # <-- FONCTION A CREER/ADAPTER
-
-
-    # --- Fin de l'Entraînement ---
-    total_training_time = time.time() - start_training_time
-    print("\n--- Training Finished ---")
-    print(f"Total Training Time: {total_training_time / 3600:.2f} hours")
-    print(f"Best Validation Loss achieved: {best_val_loss:.4f}")
-    print(f"Best model saved at: {os.path.join(config.CHECKPOINT_DIR, 'model_best_detection.pth.tar')}")
-
-
-# La fonction visualize_sample_predictions doit être adaptée pour FPN
-# La version précédente n'est pas compatible.
-# def visualize_sample_predictions_fpn(model, data_loader, device, output_dir, epoch_num, num_samples=3):
-#     """
-#     Sauvegarde des images de validation avec les boîtes GT et les prédictions FPN.
-#     NECESSITE UNE IMPLEMENTATION COMPLETE DU POST-TRAITEMENT FPN (DECODAGE + NMS)
-#     """
-#     print("Visualization function for FPN output needs implementation (decoding + NMS). Skipping visualization.")
-#     # ... Implementation future ...
-#     pass
-
+    # 8. Fin de l'entraînement
+    # Cette partie ne sera atteinte que si la boucle se termine normalement
+    total_training_time = time.time() - start_time # `start_time` est définie avant la boucle
+    print("--- Entraînement Terminé ---")
+    print(f"Durée totale de l'entraînement: {total_training_time / 3600:.2f} heures")
+    print(f"Meilleur F1-Score de validation obtenu: {best_f1_score:.4f}")
+    print(f"Le meilleur modèle a été sauvegardé dans: {os.path.join(config.CHECKPOINT_DIR, 'best_model.pth.tar')}")
+    print(f"Le dernier checkpoint a été sauvegardé dans: {os.path.join(config.CHECKPOINT_DIR, 'last_checkpoint.pth.tar')}")
 
 if __name__ == "__main__":
+    # ... (vérifications initiales inchangées) ...
     main()

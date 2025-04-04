@@ -1,5 +1,5 @@
 import torch
-
+import torchvision
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -10,39 +10,14 @@ if torch.cuda.is_available():
 else:
     print("CUDA is NOT available to PyTorch.")
 
-    # test_alb.py
-    import albumentations as A
-    import numpy as np  # Just for dummy data if needed
 
-    print(f"Using Albumentations version: {A.__version__}")  # Verify version again
-
-    try:
-        transform = A.Compose(
-            [A.HorizontalFlip(p=0.5)],  # Une transformation simple
-            polygon_params={'format': 'coco'}  # L'argument qui pose problème
-        )
-        print("Minimal A.Compose with polygon_params SUCCEEDED!")
-
-    except TypeError as e:
-        print(f"Minimal test FAILED with TypeError: {e}")
-    except Exception as e:
-        print(f"Minimal test FAILED with other Exception: {e}")
+print("PyTorch TEST___________________________")
 
 
-# test_alb.py
-import albumentations as A
-import numpy as np # Just for dummy data if needed
 
-print(f"Using Albumentations version: {A.__version__}") # Verify version again
-
-try:
-    transform = A.Compose(
-        [A.HorizontalFlip(p=0.5)], # Une transformation simple
-        polygon_params={'format': 'coco'} # L'argument qui pose problème
-    )
-    print("Minimal A.Compose with polygon_params SUCCEEDED!")
-
-except TypeError as e:
-    print(f"Minimal test FAILED with TypeError: {e}")
-except Exception as e:
-    print(f"Minimal test FAILED with other Exception: {e}")
+print("PyTorch version:", torch.__version__)
+print("Torchvision version:", torchvision.__version__)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("CUDA version used by PyTorch:", torch.version.cuda)
+    print("Device name:", torch.cuda.get_device_name(0))

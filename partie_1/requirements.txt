@@ -1,7 +1,7 @@
-torch>=1.12.0     # Version avec support stable pour transforms v2 et AMP
-torchvision>=0.13.0 # Version correspondante à torch
+# requirements.txt
+torch>=1.9.0
+torchvision>=0.10.0
 numpy>=1.20.0
-Pillow>=9.0.0     # Pour le chargement d'images
-matplotlib>=3.5.0 # Pour la visualisation
-tqdm>=4.60.0      # Pour les barres de progression
-# pycocotools    # Optionnel, si vous implémentez l'évaluation mAP COCO
+Pillow>=8.0.0
+pycocotools>=2.0.2 # Souvent nécessaire pour l'évaluation des modèles de détection, même si nous commençons simplement
+tqdm>=4.60.0 # Pour les barres de progression
