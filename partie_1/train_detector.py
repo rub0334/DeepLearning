@@ -6,6 +6,7 @@ import time
 import os
 import sys # Ajout pour sys.exit en cas d'erreur critique
 
+# Importations des modules locaux
 import config       # Notre configuration
 import utils        # Nos utilitaires (seed, checkpointing)
 import data_loader  # Notre chargement de données
@@ -17,7 +18,24 @@ def main():
     print("--- Démarrage de l'entraînement du détecteur de texte ---")
     utils.set_seed(config.RANDOM_SEED) # Fixer les graines pour la reproductibilité
     device = config.DEVICE
-    print(f"Utilisation du device: {device}")
+
+    # ---> AJOUT DU BLOC PRINT DE CONFIGURATION ICI <---
+    print("--- Configuration Utilisée ---")
+    print(f"  Device: {device}") # Utilise la variable locale 'device'
+    print(f"  Data Base Path: {config.DATA_BASE_PATH}")
+    print(f"  Checkpoint Dir: {config.CHECKPOINT_DIR}")
+    print(f"  Num Epochs: {config.NUM_EPOCHS}")
+    print(f"  Batch Size: {config.BATCH_SIZE}")
+    print(f"  Learning Rate: {config.LEARNING_RATE}")
+    print(f"  Weight Decay: {config.WEIGHT_DECAY}")
+    print(f"  LR Step Size: {config.LR_STEP_SIZE}")
+    print(f"  LR Gamma: {config.LR_GAMMA}")
+    print(f"  Eval Confidence Threshold: {config.EVAL_CONFIDENCE_THRESHOLD}")
+    print(f"  Eval IoU Threshold: {config.EVAL_IOU_THRESHOLD}")
+    print("-" * 30) # Séparateur pour la clarté
+    # ---> FIN AJOUT <---
+
+    print(f"Utilisation du device: {device}") # Peut être redondant maintenant, mais informatif
 
     # 2. Chargement des Données
     print("Chargement des données...")
@@ -26,6 +44,9 @@ def main():
     except ValueError as e:
         print(f"Erreur critique lors de la création des DataLoaders: {e}")
         sys.exit(1) # Arrêter si les datasets sont vides
+    except ImportError as e_imp: # Attraper l'erreur d'import potentiel (ex: cv2)
+        print(f"Erreur d'importation lors de la création des DataLoaders: {e_imp}")
+        sys.exit(1)
 
     # 3. Initialisation du Modèle
     print("Initialisation du modèle...")
@@ -55,55 +76,50 @@ def main():
 
     if os.path.exists(checkpoint_path):
         print(f"Reprise depuis le checkpoint: {checkpoint_path}")
-        # Passer le scheduler à load_checkpoint
         start_epoch, best_f1_score = utils.load_checkpoint(checkpoint_path, model, optimizer, scheduler=scheduler_to_load)
         print(f"Reprise à l'époque {start_epoch}. Meilleur F1 Score précédent: {best_f1_score:.4f}")
-        # Important: S'assurer que le lr_scheduler a été avancé si non chargé depuis checkpoint
-        # La fonction load_checkpoint modifiée devrait gérer ça via scheduler.load_state_dict()
 
     # 7. Boucle d'Entraînement Principale
     print("\n--- Début de la boucle d'entraînement ---")
-    start_time = time.time() # S'assurer qu'elle est définie ici
+    start_time = time.time()
 
     for epoch in range(start_epoch, config.NUM_EPOCHS):
         epoch_start_time = time.time()
 
         # --- Phase d'Entraînement ---
         try:
-            # Vérifier si la fonction existe avant de l'appeler
             if not hasattr(engine_detection, 'train_one_epoch'):
                  print("ERREUR CRITIQUE: La fonction 'train_one_epoch' est manquante dans engine_detection.py!")
                  sys.exit(1)
-
             train_loss = engine_detection.train_one_epoch(
                 model, optimizer, train_loader, device, epoch, scaler
             )
         except Exception as e_train:
              print(f"\n--- ERREUR PENDANT L'ENTRAINEMENT (Epoch {epoch+1}) ---")
-             print(f"{e_train}")
+             print(f"{type(e_train).__name__}: {e_train}")
+             import traceback
+             traceback.print_exc() # Afficher la trace complète pour le débogage
              # Optionnel: Sauvegarder l'état actuel pour débogage
-             # utils.save_checkpoint({...}, filename="error_state.pth.tar")
-             raise e_train # Relancer l'erreur pour arrêter proprement
+             # utils.save_checkpoint({...}, filename=f"error_state_epoch_{epoch+1}.pth.tar")
+             sys.exit(1) # Arrêter en cas d'erreur d'entraînement
 
 
         # --- Phase d'Évaluation des Métriques ---
         try:
-             # Vérifier si la fonction existe avant de l'appeler
             if not hasattr(engine_detection, 'evaluate_metrics'):
                  print("ERREUR CRITIQUE: La fonction 'evaluate_metrics' est manquante dans engine_detection.py!")
                  sys.exit(1)
-
             eval_metrics = engine_detection.evaluate_metrics(
                 model, val_loader, device, epoch
             )
             current_f1 = eval_metrics['f1_score']
         except Exception as e_eval:
             print(f"\n--- ERREUR PENDANT L'EVALUATION (Epoch {epoch+1}) ---")
-            print(f"{e_eval}")
-            # Décider si on continue ou arrête
-            # On pourrait juste logguer l'erreur et continuer l'entraînement suivant
-            current_f1 = 0.0 # Mettre une valeur par défaut pour éviter erreur plus loin
-            # raise e_eval # Décommenter pour arrêter en cas d'erreur d'évaluation
+            print(f"{type(e_eval).__name__}: {e_eval}")
+            import traceback
+            traceback.print_exc()
+            # On continue l'entraînement, mais on ne met pas à jour le meilleur modèle
+            current_f1 = -1.0 # Mettre une valeur qui n'est jamais la meilleure
 
         # --- Mise à jour du Scheduler ---
         if lr_scheduler is not None:
@@ -112,24 +128,27 @@ def main():
             print(f"Taux d'apprentissage pour la prochaine époque: {current_lr:.6f}")
 
         # --- Sauvegarde du Checkpoint ---
-        is_best = current_f1 > best_f1_score
-        if is_best:
-            best_f1_score = current_f1
-            print(f"** Nouveau meilleur F1-Score de validation: {best_f1_score:.4f} **")
-            utils.save_checkpoint({
-                'epoch': epoch,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'best_f1_score': best_f1_score,
-                'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler else None
-            }, filename="best_model.pth.tar")
+        # Sauvegarder seulement si l'évaluation n'a pas échoué (current_f1 != -1.0)
+        if current_f1 >= 0: # >= 0 car F1 peut être 0
+            is_best = current_f1 > best_f1_score
+            if is_best:
+                best_f1_score = current_f1
+                print(f"** Nouveau meilleur F1-Score de validation: {best_f1_score:.4f} **")
+                utils.save_checkpoint({
+                    'epoch': epoch,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_f1_score': best_f1_score,
+                    'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler else None
+                }, filename="best_model.pth.tar")
 
+        # Toujours sauvegarder le dernier état (même si l'évaluation a échoué)
         if (epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == config.NUM_EPOCHS:
             utils.save_checkpoint({
                 'epoch': epoch,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'best_f1_score': best_f1_score,
+                'best_f1_score': best_f1_score, # Sauvegarde le meilleur F1 connu
                 'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler else None
             }, filename="last_checkpoint.pth.tar")
 
@@ -138,14 +157,46 @@ def main():
         print("-" * 50)
 
     # 8. Fin de l'entraînement
-    # Cette partie ne sera atteinte que si la boucle se termine normalement
-    total_training_time = time.time() - start_time # `start_time` est définie avant la boucle
+    total_training_time = time.time() - start_time
     print("--- Entraînement Terminé ---")
     print(f"Durée totale de l'entraînement: {total_training_time / 3600:.2f} heures")
     print(f"Meilleur F1-Score de validation obtenu: {best_f1_score:.4f}")
     print(f"Le meilleur modèle a été sauvegardé dans: {os.path.join(config.CHECKPOINT_DIR, 'best_model.pth.tar')}")
     print(f"Le dernier checkpoint a été sauvegardé dans: {os.path.join(config.CHECKPOINT_DIR, 'last_checkpoint.pth.tar')}")
 
+
+# --- Protection Multiprocessing pour Windows ---
 if __name__ == "__main__":
-    # ... (vérifications initiales inchangées) ...
+    # Cette protection est essentielle sous Windows lors de l'utilisation
+    # de multiprocessing (DataLoader avec num_workers > 0).
+    # Elle garantit que le code de la fonction main() n'est exécuté
+    # que par le processus principal et non par les workers.
+
+    # Vérifications initiales des chemins
+    paths_to_check = [
+        config.TRAIN_ANNOTATION_FILE,
+        config.VAL_ANNOTATION_FILE,
+        config.TRAIN_IMAGE_DIR,
+        config.VAL_IMAGE_DIR
+    ]
+    paths_ok = True
+    for path in paths_to_check:
+        if not os.path.exists(path):
+            print(f"ERREUR CRITIQUE: Chemin non trouvé : {path}")
+            print("Vérifiez le chemin DATA_BASE_PATH dans config.py et la structure de vos dossiers.")
+            paths_ok = False
+
+    if not paths_ok:
+         print("Arrêt du script à cause de chemins manquants.")
+         sys.exit(1)
+
+    # Vérification CUDA
+    if config.DEVICE == torch.device("cuda") and not torch.cuda.is_available():
+        print("ERREUR CRITIQUE: CUDA est sélectionné dans la config mais n'est pas disponible !")
+        print("Vérifiez votre installation PyTorch et les drivers NVIDIA.")
+        sys.exit(1)
+    elif config.DEVICE == torch.device("cpu"):
+        print("Attention: Entraînement sur CPU. Cela sera TRES lent.")
+
+    # Lancer l'entraînement principal
     main()

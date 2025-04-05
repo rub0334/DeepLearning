@@ -46,13 +46,16 @@ EVAL_CONFIDENCE_THRESHOLD = 0.5
 EVAL_IOU_THRESHOLD = 0.5
 
 # Crée les dossiers nécessaires s'ils n'existent pas
+# Ces opérations sont idempotentes et peuvent rester ici sans problème
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(VISUALIZATION_DIR, exist_ok=True)
 
-print(f"Configuration chargée:")
-print(f"  Device: {DEVICE}")
-print(f"  Data Base Path: {DATA_BASE_PATH}")
-print(f"  Checkpoint Dir: {CHECKPOINT_DIR}")
-print(f"  Num Epochs: {NUM_EPOCHS}")
-print(f"  Batch Size: {BATCH_SIZE}")
-print(f"  Learning Rate: {LEARNING_RATE}")
+# --- SUPPRESSION DU BLOC PRINT CI-DESSOUS ---
+# print(f"Configuration chargée:")
+# print(f"  Device: {DEVICE}")
+# print(f"  Data Base Path: {DATA_BASE_PATH}")
+# print(f"  Checkpoint Dir: {CHECKPOINT_DIR}")
+# print(f"  Num Epochs: {NUM_EPOCHS}")
+# print(f"  Batch Size: {BATCH_SIZE}")
+# print(f"  Learning Rate: {LEARNING_RATE}")
+# --- FIN SUPPRESSION ---
